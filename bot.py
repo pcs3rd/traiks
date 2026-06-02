@@ -42,6 +42,17 @@ CLOSED_KEYWORDS = ["closed", "full", "ended", "over", "no longer", "not acceptin
 
 OPEN_EMOJI  = "🟢"
 CLOSED_EMOJI = "🔴"
+SUBS_FILE = Path("/data/subscriptions.json")
+
+# Category keywords — maps category name -> terms to match in post title/body
+CATEGORIES: dict[str, list[str]] = {
+    "movies":  ["movie", "film", "cinema", "blu-ray", "bluray", "hdr", "remux"],
+    "tv":      ["tv", "television", "series", "shows", "episodes"],
+    "music":   ["music", "audio", "flac", "lossless", "discography", "albums"],
+    "books":   ["books", "ebooks", "epub", "comics", "manga"],
+    "games":   ["games", "gaming", "console", "pc games"],
+    "general": ["general", "ratio-free", "freeleech"],
+}
 
 # Patterns to extract end dates from post text.
 # Tries to find phrases like "closes June 5", "until 2026-06-10", "deadline: June 5th", etc.
@@ -73,6 +84,52 @@ def load_threads() -> dict:
 def save_threads(threads: dict):
     THREADS_FILE.parent.mkdir(parents=True, exist_ok=True)
     THREADS_FILE.write_text(json.dumps(threads))
+
+
+def load_subs() -> dict:
+    """Returns {user_id_str: [category, ...]}"""
+    if SUBS_FILE.exists():
+        return json.loads(SUBS_FILE.read_text())
+    return {}
+
+
+def save_subs(subs: dict):
+    SUBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SUBS_FILE.write_text(json.dumps(subs))
+
+
+def match_categories(text: str) -> list[str]:
+    """Return which categories the post matches."""
+    lower = text.lower()
+    return [cat for cat, terms in CATEGORIES.items() if any(t in lower for t in terms)]
+
+
+def extract_links(text: str) -> list[str]:
+    """Extract all URLs from post body."""
+    return re.findall(r'https?://[^\s\)\]\"]+', text)
+
+
+def extract_open_date(text: str) -> datetime | None:
+    """Try to parse an open/start date from post text."""
+    patterns = [
+        r"(?:open(?:s|ing)?|start(?:s|ing)?|begin(?:s|ning)?|launch(?:es|ing)?)\s+(?:on\s+)?([A-Za-z]+\.?\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?)",
+        r"(?:open(?:s|ing)?|start(?:s|ing)?)\s+(?:on\s+)?(\d{4}-\d{2}-\d{2})",
+        r"(?:open(?:s|ing)?|start(?:s|ing)?)\s+(?:on\s+)?(\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            raw = match.group(1).strip().rstrip(".")
+            for fmt in ("%B %d %Y", "%B %d, %Y", "%b %d %Y", "%b %d, %Y",
+                        "%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+                try:
+                    cleaned = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", raw)
+                    if not re.search(r"\d{4}", cleaned):
+                        cleaned = f"{cleaned} {datetime.now().year}"
+                    return datetime.strptime(cleaned.strip(), fmt).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+    return None
 
 
 def is_relevant(title: str) -> bool:
@@ -147,38 +204,71 @@ async def post_notification(channel: discord.TextChannel, data: dict):
 
     closed = is_closed(combined)
     end_date = extract_end_date(combined)
+    open_date = extract_open_date(combined)
+    links = extract_links(body)
+    matched_cats = match_categories(combined)
     if end_date and end_date < datetime.now(timezone.utc):
         closed = True
 
-    color = 0x57f287 if not closed else 0xed4245  # green / red
+    color = 0x57f287 if not closed else 0xed4245
 
+    # Build mention string for subscribers of matched categories
+    subs = load_subs()
+    mention_ids = set()
+    for uid, cats in subs.items():
+        if any(c in matched_cats for c in cats) or "general" in cats:
+            mention_ids.add(int(uid))
+    mentions = " ".join(f"<@{uid}>" for uid in mention_ids) if mention_ids else ""
+
+    # Channel embed (compact summary)
     embed = discord.Embed(title=title, url=url, color=color)
     embed.add_field(name="Status", value="🔴 Closed" if closed else "🟢 Open", inline=True)
+    if open_date:
+        embed.add_field(name="Opens", value=format_end_date(open_date), inline=True)
     embed.add_field(name="Closes", value=format_end_date(end_date), inline=True)
+    if matched_cats:
+        embed.add_field(name="Categories", value=" ".join(f"`{c}`" for c in matched_cats), inline=False)
     embed.set_footer(text=f"r/{data['subreddit']} • u/{data['author']}")
 
-    msg = await channel.send(embed=embed)
+    msg = await channel.send(content=mentions or None, embed=embed)
     await msg.add_reaction(CLOSED_EMOJI if closed else OPEN_EMOJI)
 
-    # Create a thread for full details and discussion
     thread = await msg.create_thread(
         name=title[:100],
         auto_archive_duration=10080,  # 7 days
     )
 
-    thread_body = body[:3800] if body else "*No body text.*"
-    detail_embed = discord.Embed(title="Full post", url=url, color=color, description=thread_body)
-    detail_embed.add_field(name="Closes", value=format_end_date(end_date), inline=True)
-    detail_embed.add_field(name="Subreddit", value=f"r/{data['subreddit']}", inline=True)
-    detail_embed.add_field(name="Posted by", value=f"u/{data['author']}", inline=True)
-    await thread.send(embed=detail_embed)
+    # Thread header — dates + links first, clean and scannable
+    header_lines = [
+        f"**[View on Reddit]({url})**",
+        f"**Status:** {'🔴 Closed' if closed else '🟢 Open'}",
+    ]
+    if open_date:
+        header_lines.append(f"**Opens:** {format_end_date(open_date)}")
+    header_lines.append(f"**Closes:** {format_end_date(end_date)}")
+    if links:
+        header_lines.append("**Links:**")
+        for link in links[:5]:  # cap at 5
+            header_lines.append(f"• <{link}>")
+    header_lines += [
+        f"**Posted by:** u/{data['author']} in r/{data['subreddit']}",
+        "─" * 30,
+    ]
+    await thread.send("\n".join(header_lines))
 
-    # Persist so we can flip reactions when status changes
+    # Body in a separate message so it doesn't clutter the header
+    if body:
+        chunks = [body[i:i+1900] for i in range(0, min(len(body), 3800), 1900)]
+        for chunk in chunks:
+            await thread.send(chunk)
+
+    # Persist for reaction flipping
     threads = load_threads()
     threads[data["id"]] = {
         "message_id": msg.id,
         "thread_id": thread.id,
         "channel_id": channel.id,
+        "open_date": open_date.isoformat() if open_date else None,
         "end_date": end_date.isoformat() if end_date else None,
         "closed": closed,
     }
@@ -336,6 +426,70 @@ async def cmd_interval(ctx, seconds: int):
     CHECK_INTERVAL = seconds
     scheduled_check.change_interval(seconds=seconds)
     await ctx.send(f"Check interval updated to {seconds}s.")
+
+
+@bot.command(name="notify")
+async def cmd_notify(ctx, *categories: str):
+    """Subscribe to notifications for categories. Usage: !notify movies tv music
+    Available: movies, tv, music, books, games, general"""
+    valid = [c.lower() for c in categories if c.lower() in CATEGORIES]
+    invalid = [c for c in categories if c.lower() not in CATEGORIES]
+    if not valid:
+        cats = ", ".join(f"`{c}`" for c in CATEGORIES)
+        await ctx.send(f"No valid categories. Available: {cats}")
+        return
+    subs = load_subs()
+    uid = str(ctx.author.id)
+    existing = set(subs.get(uid, []))
+    existing.update(valid)
+    subs[uid] = list(existing)
+    save_subs(subs)
+    msg = f"You'll be notified for: {', '.join(f'`{c}`' for c in sorted(existing))}"
+    if invalid:
+        msg += f"\nUnknown categories ignored: {', '.join(f'`{c}`' for c in invalid)}"
+    await ctx.send(msg)
+
+
+@bot.command(name="unnotify")
+async def cmd_unnotify(ctx, *categories: str):
+    """Unsubscribe from categories. Usage: !unnotify movies
+    Use !unnotify all to remove all subscriptions."""
+    subs = load_subs()
+    uid = str(ctx.author.id)
+    if not categories or "all" in categories:
+        subs.pop(uid, None)
+        save_subs(subs)
+        await ctx.send("Removed all your notification subscriptions.")
+        return
+    existing = set(subs.get(uid, []))
+    removed = [c.lower() for c in categories if c.lower() in existing]
+    existing -= set(removed)
+    if existing:
+        subs[uid] = list(existing)
+    else:
+        subs.pop(uid, None)
+    save_subs(subs)
+    await ctx.send(f"Removed: {', '.join(f'`{c}`' for c in removed) or 'nothing'}. Still subscribed to: {', '.join(f'`{c}`' for c in sorted(existing)) or 'nothing'}")
+
+
+@bot.command(name="mynotify")
+async def cmd_mynotify(ctx):
+    """Show your current notification subscriptions."""
+    subs = load_subs()
+    cats = subs.get(str(ctx.author.id), [])
+    if not cats:
+        await ctx.send("You have no notification subscriptions. Use `!notify <category>` to subscribe.")
+    else:
+        await ctx.send(f"You're subscribed to: {', '.join(f'`{c}`' for c in sorted(cats))}")
+
+
+@bot.command(name="categories")
+async def cmd_categories(ctx):
+    """List available notification categories."""
+    embed = discord.Embed(title="Notification categories", color=0x00b0f4)
+    for cat, terms in CATEGORIES.items():
+        embed.add_field(name=f"`{cat}`", value=", ".join(terms[:5]), inline=False)
+    await ctx.send(embed=embed)
 
 
 bot.run(DISCORD_TOKEN)
