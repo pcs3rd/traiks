@@ -1,0 +1,14 @@
+services:
+  traiks:
+    image: ghcr.io/pcs3rd/traiks:latest
+    restart: unless-stopped
+    environment:
+      - DISCORD_TOKEN=your_bot_token_here
+      - DISCORD_CHANNEL_ID=123456789012345678
+      - CHECK_INTERVAL=900  # seconds between checks (default: 900 = 15 min)
+    volumes:
+      - state:/data
+
+volumes:
+  state:
+    driver: local
