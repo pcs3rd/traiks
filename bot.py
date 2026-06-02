@@ -32,7 +32,31 @@ THREADS_FILE = Path("/data/threads.json")
 REDDIT_USER_AGENT = "Mozilla/5.0 (compatible; traiks-bot/1.0; +https://github.com/pcs3rd/traiks)"
 
 
-SUBREDDITS = ["trackers", "opensignups"]
+DEFAULT_SUBREDDITS = ["trackers", "opensignups"]
+SUBREDDITS_FILE = Path("/data/subreddits.json")
+RSS_FILE = Path("/data/rss_feeds.json")
+
+
+def load_subreddits() -> list[str]:
+    if SUBREDDITS_FILE.exists():
+        return json.loads(SUBREDDITS_FILE.read_text())
+    return list(DEFAULT_SUBREDDITS)
+
+
+def save_subreddits(subs: list[str]):
+    SUBREDDITS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SUBREDDITS_FILE.write_text(json.dumps(subs))
+
+
+def load_rss_feeds() -> list[str]:
+    if RSS_FILE.exists():
+        return json.loads(RSS_FILE.read_text())
+    return []
+
+
+def save_rss_feeds(feeds: list[str]):
+    RSS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    RSS_FILE.write_text(json.dumps(feeds))
 KEYWORDS = [
     "open signup", "open signups", "open registration", "now open",
     "invites", "invite", "recruiting", "recruitment", "free invite",
@@ -195,6 +219,52 @@ async def fetch_posts(session: aiohttp.ClientSession, subreddit: str) -> list:
         return []
 
 
+async def fetch_rss(session: aiohttp.ClientSession, feed_url: str) -> list:
+    """Fetch an arbitrary RSS/Atom feed and normalise entries to the same dict shape."""
+    try:
+        from xml.etree import ElementTree as ET
+        headers = {"User-Agent": REDDIT_USER_AGENT}
+        async with session.get(feed_url, headers=headers) as r:
+            text = await r.text()
+        root = ET.fromstring(text)
+        entries = []
+        # Atom
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        for entry in root.findall("atom:entry", ns) or root.findall("entry"):
+            title = entry.findtext("atom:title", "", ns) or entry.findtext("title", "")
+            link_el = entry.find("atom:link", ns) or entry.find("link")
+            link = (link_el.get("href") or link_el.text or "") if link_el is not None else ""
+            body = entry.findtext("atom:content", "", ns) or entry.findtext("atom:summary", "", ns) or entry.findtext("description", "")
+            entry_id = entry.findtext("atom:id", "", ns) or entry.findtext("id", link)
+            entries.append({"data": {
+                "id": f"rss_{hash(entry_id) & 0xffffffff:08x}",
+                "title": title,
+                "permalink": link,
+                "selftext": body or "",
+                "author": feed_url,
+                "subreddit": feed_url,
+            }})
+        # RSS 2.0
+        if not entries:
+            for item in root.findall(".//item"):
+                title = item.findtext("title", "")
+                link = item.findtext("link", "")
+                body = item.findtext("description", "")
+                guid = item.findtext("guid", link)
+                entries.append({"data": {
+                    "id": f"rss_{hash(guid) & 0xffffffff:08x}",
+                    "title": title,
+                    "permalink": link,
+                    "selftext": body or "",
+                    "author": feed_url,
+                    "subreddit": feed_url,
+                }})
+        return entries
+    except Exception as e:
+        print(f"[error] fetching RSS {feed_url}: {e}")
+        return []
+
+
 async def post_notification(channel: discord.TextChannel, data: dict):
     """Post embed + thread + reaction for a matched post."""
     title = data["title"]
@@ -286,7 +356,22 @@ async def run_check(notify: bool = True) -> tuple[int, int]:
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
 
     async with aiohttp.ClientSession() as session:
-        for subreddit in SUBREDDITS:
+        for feed_url in load_rss_feeds():
+            posts = await fetch_rss(session, feed_url)
+            for post in posts:
+                data = post["data"]
+                post_id = data["id"]
+                new_seen.add(post_id)
+                checked += 1
+                if post_id in seen:
+                    continue
+                if is_relevant(data["title"]):
+                    found += 1
+                    if notify and channel:
+                        await post_notification(channel, data)
+                        await asyncio.sleep(1)
+
+        for subreddit in load_subreddits():
             posts = await fetch_posts(session, subreddit)
             for post in posts:
                 data = post["data"]
@@ -481,6 +566,73 @@ async def cmd_mynotify(ctx):
         await ctx.send("You have no notification subscriptions. Use `!notify <category>` to subscribe.")
     else:
         await ctx.send(f"You're subscribed to: {', '.join(f'`{c}`' for c in sorted(cats))}")
+
+
+@bot.command(name="subreddits")
+async def cmd_subreddits(ctx):
+    """List watched subreddits."""
+    subs = load_subreddits()
+    await ctx.send("Watching: " + ", ".join(f"`r/{s}`" for s in subs))
+
+
+@bot.command(name="addsub")
+async def cmd_addsub(ctx, subreddit: str):
+    """Add a subreddit to watch. Usage: !addsub torrents"""
+    subreddit = subreddit.lstrip("r/").lower()
+    subs = load_subreddits()
+    if subreddit in subs:
+        await ctx.send(f"`r/{subreddit}` is already being watched.")
+        return
+    subs.append(subreddit)
+    save_subreddits(subs)
+    await ctx.send(f"Added `r/{subreddit}` to the watch list.")
+
+
+@bot.command(name="removesub")
+async def cmd_removesub(ctx, subreddit: str):
+    """Remove a subreddit. Usage: !removesub torrents"""
+    subreddit = subreddit.lstrip("r/").lower()
+    subs = load_subreddits()
+    if subreddit not in subs:
+        await ctx.send(f"`r/{subreddit}` is not being watched.")
+        return
+    subs.remove(subreddit)
+    save_subreddits(subs)
+    await ctx.send(f"Removed `r/{subreddit}` from the watch list.")
+
+
+@bot.command(name="rss")
+async def cmd_rss(ctx):
+    """List watched RSS feeds."""
+    feeds = load_rss_feeds()
+    if not feeds:
+        await ctx.send("No RSS feeds configured. Use `!addrss <url>` to add one.")
+        return
+    await ctx.send("RSS feeds:\n" + "\n".join(f"• <{f}>" for f in feeds))
+
+
+@bot.command(name="addrss")
+async def cmd_addrss(ctx, url: str):
+    """Add an RSS feed to watch. Usage: !addrss https://example.com/feed.xml"""
+    feeds = load_rss_feeds()
+    if url in feeds:
+        await ctx.send("That feed is already being watched.")
+        return
+    feeds.append(url)
+    save_rss_feeds(feeds)
+    await ctx.send(f"Added RSS feed: <{url}>")
+
+
+@bot.command(name="removerss")
+async def cmd_removerss(ctx, url: str):
+    """Remove an RSS feed. Usage: !removerss https://example.com/feed.xml"""
+    feeds = load_rss_feeds()
+    if url not in feeds:
+        await ctx.send("That feed isn't being watched.")
+        return
+    feeds.remove(url)
+    save_rss_feeds(feeds)
+    await ctx.send(f"Removed RSS feed: <{url}>")
 
 
 @bot.command(name="categories")
