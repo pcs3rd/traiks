@@ -29,7 +29,8 @@ DISCORD_CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", 900))
 STATE_FILE = Path("/data/seen_posts.json")
 THREADS_FILE = Path("/data/threads.json")
-REDDIT_HEADERS = {"User-Agent": "tracker-watcher-bot/1.0"}
+REDDIT_USER_AGENT = "Mozilla/5.0 (compatible; traiks-bot/1.0; +https://github.com/pcs3rd/traiks)"
+
 
 SUBREDDITS = ["trackers", "opensignups"]
 KEYWORDS = [
@@ -126,11 +127,12 @@ last_found: int = 0
 
 
 async def fetch_posts(session: aiohttp.ClientSession, subreddit: str) -> list:
-    url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=25"
+    url = f"https://arctic-shift.photon-reddit.com/api/posts/search?subreddit={subreddit}&limit=25&sort=new"
     try:
-        async with session.get(url, headers=REDDIT_HEADERS) as r:
+        headers = {"User-Agent": REDDIT_USER_AGENT}
+        async with session.get(url, headers=headers) as r:
             data = await r.json()
-            return data["data"]["children"]
+        return [{"data": p} for p in data.get("data", [])]
     except Exception as e:
         print(f"[error] fetching r/{subreddit}: {e}")
         return []
