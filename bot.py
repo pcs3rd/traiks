@@ -127,7 +127,7 @@ last_found: int = 0
 
 
 async def fetch_posts(session: aiohttp.ClientSession, subreddit: str) -> list:
-    url = f"https://arctic-shift.photon-reddit.com/api/posts/search?subreddit={subreddit}&limit=25&sort=new"
+    url = f"https://arctic-shift.photon-reddit.com/api/posts/search?subreddit={subreddit}&limit=25&sort=desc"
     try:
         headers = {"User-Agent": REDDIT_USER_AGENT}
         async with session.get(url, headers=headers) as r:
